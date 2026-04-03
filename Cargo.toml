@@ -1,0 +1,9 @@
+[package]
+name = "allocator-memfd-secret"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+allocator-api2 = { version = "0.3.1", default-features = false }
+libc = { version = "0.2.184", default-features = false }
+linked_list_allocator = { version = "0.10.5", default-features = false, features = [] }
