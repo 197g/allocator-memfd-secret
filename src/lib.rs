@@ -48,7 +48,7 @@ const MIN_SZ_POT2: u8 = 12;
 struct MapIndexForPot(u8);
 
 impl SecretArena {
-    pub fn new() -> Result<Self, ()> {
+    pub fn new() -> Result<Self, MemfdSecretFailed> {
         let mut limits: libc::rlimit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -61,7 +61,7 @@ impl SecretArena {
         // Though this is Linux specific, on other systems `libc` does not expose it. At worst I
         // expect that to be rejected with an error code.
         if 0 > unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limits) } {
-            return Err(());
+            return Err(MemfdSecretFailed::INIT);
         }
 
         let size = usize::try_from(limits.rlim_cur).unwrap_or(usize::MAX);
@@ -72,14 +72,14 @@ impl SecretArena {
     ///
     /// Using a size larger than the `RLIMIT_MEMLOCK` limits of the process (see `mlock(2)`) will
     /// appear to work but may fail at runtime when mapping pages from the file to the process.
-    pub fn with_size_limit(size: usize) -> Result<Self, ()> {
+    pub fn with_size_limit(size: usize) -> Result<Self, MemfdSecretFailed> {
         // Safety: `0` is a valid flag for this syscall. Signature:
         //
         //     int syscall(SYS_memfd_secret, unsigned int flags);.
         let res = unsafe { libc::syscall(libc::SYS_memfd_secret, 0) };
 
         if 0 > res {
-            return Err(());
+            return Err(MemfdSecretFailed::INIT);
         }
 
         Ok(SecretArena {
@@ -360,9 +360,21 @@ impl SecretArena {
     }
 }
 
-unsafe impl Send for SecretArena {}
+// Sufficient but minimal impls that make the allocator `Send + Sync`.
+//
+// Safety: The pointers/mmap we keep are valid for the whole process. Sending implies ownership of
+// the allocator, nothing can be invalidated.
+unsafe impl Send for Mapping {}
 
-unsafe impl Sync for SecretArena {}
+// Safety: we do not provide access to any resource that is not `Sync` itself. The mapping is never
+// dereferenced, the allocator is itself `Sync` and only accessed by shared reference.
+unsafe impl Sync for Mapping {}
+
+const _IS_SEND_AND_SYNC: () = {
+    const fn requires_send_and_sync<T: Send + Sync + 'static>() {}
+
+    requires_send_and_sync::<SecretArena>();
+};
 
 impl Drop for SecretArena {
     fn drop(&mut self) {
@@ -427,6 +439,26 @@ unsafe impl Allocator for SecretArena {
         // - the only layout that 'fits' is the one used precisely so `layout` must be the one that
         //   was used and we can forward that requirement from `allocator-api2`.
         unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) }
+    }
+}
+
+#[derive(Debug)]
+// Force the compiler to make some decisions as if this could have all potential obstacles, do not
+// make structural inference about this type as much as possible.
+#[non_exhaustive]
+pub struct MemfdSecretFailed {
+    // Private internals, and not a zero-sized struct.
+    #[allow(dead_code)]
+    inner: u8,
+}
+
+impl MemfdSecretFailed {
+    const INIT: Self = MemfdSecretFailed { inner: 0 };
+}
+
+impl core::fmt::Display for MemfdSecretFailed {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str("failed to instantiate a `memfd_secret`")
     }
 }
 
