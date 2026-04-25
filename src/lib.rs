@@ -1,7 +1,12 @@
 // #![no_std]
 
-use allocator_api2::alloc::{AllocError, Allocator, Layout};
-use core::{alloc::GlobalAlloc, ptr};
+#[cfg(feature = "allocator-api2")]
+use allocator_api2::alloc::{AllocError, Allocator};
+
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    ptr,
+};
 
 use linked_list_allocator::LockedHeap;
 use spin::Once;
@@ -168,28 +173,12 @@ impl SecretArena {
 
         true
     }
-}
 
-impl Drop for SecretArena {
-    fn drop(&mut self) {
-        for map in &mut self.maps {
-            if let Some(Some(mapping)) = map.get_mut() {
-                let addr = mapping.inner.as_ptr().cast::<libc::c_void>();
-                let len = mapping.inner.len();
-                unsafe { (self.fns.munmap)(addr, len) };
-            }
-        }
-
-        unsafe { (self.fns.close)(self.fd) };
-    }
-}
-
-unsafe impl Allocator for SecretArena {
-    fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
+    fn alloc_optional(&self, layout: Layout) -> Option<ptr::NonNull<[u8]>> {
         if layout.size() == 0 {
             // MSRV: 1.95. But nice feature that avoids a badly aligned accident.
             let dangling = layout.dangling_ptr();
-            return Ok(ptr::NonNull::slice_from_raw_parts(dangling, 0));
+            return Some(ptr::NonNull::slice_from_raw_parts(dangling, 0));
         }
 
         self.pre_ensure_size(layout);
@@ -206,7 +195,7 @@ unsafe impl Allocator for SecretArena {
             }
 
             let Some(Some(map)) = self.maps[map_idx].get() else {
-                return Err(AllocError);
+                return None;
             };
 
             // Safety: checked zero-size above.
@@ -220,14 +209,35 @@ unsafe impl Allocator for SecretArena {
                     byte_offset < map.inner.len()
                 });
 
-                return Ok(ptr::NonNull::slice_from_raw_parts(base, len));
+                return Some(ptr::NonNull::slice_from_raw_parts(base, len));
             }
         }
 
-        Err(AllocError)
+        None
+    }
+}
+
+impl Drop for SecretArena {
+    fn drop(&mut self) {
+        for map in &mut self.maps {
+            if let Some(Some(mapping)) = map.get_mut() {
+                let addr = mapping.inner.as_ptr().cast::<libc::c_void>();
+                let len = mapping.inner.len();
+                unsafe { (self.fns.munmap)(addr, len) };
+            }
+        }
+
+        unsafe { (self.fns.close)(self.fd) };
+    }
+}
+
+unsafe impl GlobalAlloc for SecretArena {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.alloc_optional(layout)
+            .map_or_else(ptr::null_mut, |ptr| ptr.as_ptr().cast())
     }
 
-    unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if layout.size() == 0 {
             // Nothing to do, this was allocated as dangling.
             return;
@@ -241,7 +251,7 @@ unsafe impl Allocator for SecretArena {
                 continue;
             };
 
-            let byte_offset = ptr.as_ptr().addr().wrapping_sub(map.inner.as_ptr().addr());
+            let byte_offset = ptr.addr().wrapping_sub(map.inner.as_ptr().addr());
 
             // Can't have zero-length allocations, anything on the boundary belongs to the another
             // map if any.
@@ -249,12 +259,27 @@ unsafe impl Allocator for SecretArena {
                 continue;
             }
 
-            unsafe { map.heap.dealloc(ptr.as_ptr(), layout) };
+            unsafe { map.heap.dealloc(ptr, layout) };
             return;
         }
 
         debug_assert!(false, "Tried to deallocate a pointer from a wrong heap");
         // Do nothing without debug assertions, leaks the pointer but is internally sound.
+    }
+}
+
+#[cfg(feature = "allocator-api2")]
+unsafe impl Allocator for SecretArena {
+    fn allocate(&self, layout: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
+        self.alloc_optional(layout).ok_or(AllocError)
+    }
+
+    unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: Layout) {
+        // Safety:
+        // - a block of this allocator, as ensured by `allocator-api2`.
+        // - the only layout that 'fits' is the one used precisely so `layout` must be the one that
+        //   was used and we can forward that requirement from `allocator-api2`.
+        unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) }
     }
 }
 
