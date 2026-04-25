@@ -1,4 +1,4 @@
-// #![no_std]
+#![no_std]
 
 #[cfg(feature = "allocator-api2")]
 use allocator_api2::alloc::{AllocError, Allocator};
@@ -8,16 +8,27 @@ use core::{
     ptr,
 };
 
+#[cfg(target_has_atomic = "ptr")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use linked_list_allocator::LockedHeap;
 use spin::Once;
 
 /// An arena allocator, backed by a memfd-secret.
 pub struct SecretArena {
-    fd: libc::c_int,
-    maps: [Once<Option<Mapping>>; 48],
-    len_limit: usize,
-    truncates: Once<bool>,
+    /// The functions used to interact with the OS.
     fns: FnTable,
+    fd: libc::c_int,
+    len_limit: usize,
+    maps: [Once<Option<Mapping>>; 48],
+    truncates: Once<bool>,
+    diagnostics: Diagnostics,
+}
+
+#[derive(Default)]
+struct Diagnostics {
+    #[cfg(target_has_atomic = "ptr")]
+    failure: AtomicUsize,
 }
 
 struct Mapping {
@@ -33,27 +44,46 @@ struct MapIndexForPot(u8);
 
 impl SecretArena {
     pub fn new() -> Result<Self, ()> {
+        let mut limits: libc::rlimit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+
+        // Safety: Valid resource for the call. Signature:
+        //
+        //     int getrlimit(int resource, struct rlimit *rlp);
+        //
+        // Though this is Linux specific, on other systems `libc` does not expose it. At worst I
+        // expect that to be rejected with an error code.
+        if 0 > unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limits) } {
+            return Err(());
+        }
+
+        let size = usize::try_from(limits.rlim_cur).unwrap_or(usize::MAX);
+        Self::with_size_limit(size)
+    }
+
+    /// Create a `memfd_secret` with a pre-determined size.
+    ///
+    /// Using a size larger than the `RLIMIT_MEMLOCK` limits of the process (see `mlock(2)`) will
+    /// appear to work but may fail at runtime when mapping pages from the file to the process.
+    pub fn with_size_limit(size: usize) -> Result<Self, ()> {
+        // Safety: `0` is a valid flag for this syscall. Signature:
+        //
+        //     int syscall(SYS_memfd_secret, unsigned int flags);.
         let res = unsafe { libc::syscall(libc::SYS_memfd_secret, 0) };
 
         if 0 > res {
             return Err(());
         }
 
-        let mut limits: libc::rlimit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-
-        if 0 > unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limits) } {
-            return Err(());
-        }
-
         Ok(SecretArena {
             fd: res as libc::c_int,
             maps: [const { Once::new() }; 48],
-            len_limit: limits.rlim_cur as usize,
+            len_limit: size,
             truncates: Once::new(),
             fns: FnTable::libc(),
+            diagnostics: Default::default(),
         })
     }
 
@@ -64,6 +94,23 @@ impl SecretArena {
     /// potential usage.
     pub fn memfd_len(&self) -> usize {
         self.len_limit
+    }
+
+    /// Did a `truncate` syscall fail?
+    ///
+    /// That is not fatal but essentially leaves this allocator without any resources. That is,
+    /// only zero-sized allocations can be served.
+    pub fn failed_truncate(&self) -> bool {
+        self.diagnostics.load_failure() & Diagnostics::MASK_TRUNCATE != 0
+    }
+
+    /// Did an `mmap` syscall fail?
+    ///
+    /// That is not fatal but leaves this allocator with limited resources. The total amount of
+    /// memory that can be served is fixed after this point. The failure may indicate that the
+    /// number of pages would exceed the allowed limit of `RLIMIT_MEMLOCK` pages.
+    pub fn failed_mmap(&self) -> bool {
+        self.diagnostics.load_failure() & Diagnostics::MASK_MMAP != 0
     }
 
     fn pre_ensure_size(&self, target: Layout) {
@@ -126,24 +173,25 @@ impl SecretArena {
             .call_once(|| 0 == unsafe { (self.fns.truncate)(self.fd, self.len_limit as i64) });
 
         if !successfully_truncated_at_least {
-            eprintln!("Failed to truncate {} {}", offset + len, unsafe {
-                libc::sysconf(libc::_SC_PAGESIZE)
-            });
-
+            self.diagnostics.truncate_failed(self.len_limit);
             return false;
         }
 
         // We should hit this only if you passed a customized function table.
         #[cold]
         fn mmap_null_ptr_oopsie<T>() -> Option<ptr::NonNull<T>> {
-            panic!("Bad mmap: {}", unsafe { *libc::__errno_location() });
+            panic!("Bad mmap implementation: {}", unsafe {
+                *libc::__errno_location()
+            });
         }
 
+        let mut called_here = false;
         let mapping = map.call_once(|| {
+            called_here = true;
+
             let ptr = unsafe { (self.fns.mmap_at)(self.fd, len, offset as i64) };
 
             if ptr == libc::MAP_FAILED {
-                eprintln!("Mmap failed {len}, {offset}");
                 return None;
             }
 
@@ -166,8 +214,11 @@ impl SecretArena {
             })
         });
 
+        if called_here && mapping.is_none() {
+            self.diagnostics.mmap_failed();
+        }
+
         if mapping.is_none() {
-            eprintln!("Mapping {newpot} not established");
             return false;
         };
 
@@ -216,6 +267,9 @@ impl SecretArena {
         None
     }
 }
+
+unsafe impl Send for SecretArena {}
+unsafe impl Sync for SecretArena {}
 
 impl Drop for SecretArena {
     fn drop(&mut self) {
@@ -280,6 +334,34 @@ unsafe impl Allocator for SecretArena {
         // - the only layout that 'fits' is the one used precisely so `layout` must be the one that
         //   was used and we can forward that requirement from `allocator-api2`.
         unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) }
+    }
+}
+
+impl Diagnostics {
+    const MASK_TRUNCATE: usize = 1 << 0;
+    const MASK_MMAP: usize = 1 << 1;
+
+    fn truncate_failed(&self, _requested_len: usize) {
+        #[cfg(target_has_atomic = "ptr")]
+        self.failure
+            .fetch_or(Self::MASK_TRUNCATE, Ordering::Relaxed);
+    }
+
+    fn mmap_failed(&self) {
+        #[cfg(target_has_atomic = "ptr")]
+        self.failure.fetch_or(Self::MASK_MMAP, Ordering::Relaxed);
+    }
+
+    fn load_failure(&self) -> usize {
+        #[cfg(target_has_atomic = "ptr")]
+        {
+            self.failure.load(Ordering::Relaxed)
+        }
+
+        #[cfg(not(target_has_atomic = "ptr"))]
+        {
+            0
+        }
     }
 }
 
