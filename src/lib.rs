@@ -1,4 +1,8 @@
 #![no_std]
+#![cfg_attr(
+    feature = "allocator-api2",
+    doc = include_str!("../Readme.md")
+)]
 
 #[cfg(feature = "allocator-api2")]
 use allocator_api2::alloc::{AllocError, Allocator};

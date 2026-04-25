@@ -1,6 +1,15 @@
 [package]
 name = "allocator-memfd-secret"
 version = "1.0.0"
+
+categories = ["os::linux-apis"]
+keywords = ["memfd_secret"]
+description = "An allocator with backing memory in a Linux `memfd_secret`"
+authors = ["Aurelia Molzer aka. 197g <5550310+197g@users.noreply.github.com>"]
+license = "EUPL-1.1+"
+readme = "Readme.md"
+repository = "https://github.com/197g/allocator-memfd-secret"
+
 edition = "2024"
 rust-version = "1.95"
 
@@ -12,6 +21,10 @@ spin = { version = "0.10.0", default-features = false, features = ["once"] }
 
 [dev-dependencies]
 allocator-api2 = { version = "*", default-features = false, features = ["alloc"] }
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [[test]]
 name = "usage"
