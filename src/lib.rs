@@ -15,6 +15,11 @@ use linked_list_allocator::LockedHeap;
 use spin::Once;
 
 /// An arena allocator, backed by a memfd-secret.
+///
+/// This value is quite large by design. That should not be an issue if put into a static as a
+/// global allocator, however in other situations you may prefer boxing it up itself. For the
+/// former you have to bring your own initialization routine (that copes with or ignores
+/// allocations requested before the file descriptor is fully opened).
 pub struct SecretArena {
     /// The functions used to interact with the OS.
     fns: FnTable,
@@ -25,18 +30,18 @@ pub struct SecretArena {
     diagnostics: Diagnostics,
 }
 
-#[derive(Default)]
-struct Diagnostics {
-    #[cfg(target_has_atomic = "ptr")]
-    failure: AtomicUsize,
-}
-
 struct Mapping {
     // If we fail to establish a mapping, that is terminal.
     inner: ptr::NonNull<[u8]>,
     heap: LockedHeap,
 }
 
+// Motivated by one typical PAGE_SZ.
+//
+// FIXME: `mmap` will probably fail on systems where we only have larger pages than this. So this
+// should be a runtime constant? Then we have some entries in `maps` that are pointless but that's
+// fine? Or do we create a starting bias instead and keep the start of that array untouched? Maybe
+// provide a PR motivated by such a system if not fixed yet.
 const MIN_SZ_POT2: u8 = 12;
 
 #[derive(Clone, Copy)]
@@ -87,6 +92,35 @@ impl SecretArena {
         })
     }
 
+    /// Unmap all pages of the file, resetting the allocator.
+    ///
+    /// You should assume that this drops the value passed in, implying also that any allocations
+    /// that were allocated from it are no longer considered live after this. Note that the file
+    /// size, [`Self::memfd_len`], will be unaffected and can not be changed.
+    ///
+    /// This unlocks all pages that were mapped into the process.
+    ///
+    /// Design note: Taking `&mut self` would place somewhat underspecified requirements on this
+    /// method with the [`Allocator`][`allocator_api2::alloc::Allocator`] safety contract. It's not
+    /// clear if the value can be considered the same allocator afterwards, which would not allow
+    /// us to invalidate existing allocations. The value is not `Clone` and we _could_ have
+    /// replaced it with another in this method but it's unclear what identity is used here.
+    pub fn unmap(mut this: Self) -> Self {
+        for map in &mut this.maps {
+            if let Some(Some(mapping)) = map.get_mut() {
+                let addr = mapping.inner.as_ptr().cast::<libc::c_void>();
+                let len = mapping.inner.len();
+                unsafe { (this.fns.munmap)(addr, len) };
+            }
+
+            *map = Once::new();
+        }
+
+        this.diagnostics.reset();
+
+        this
+    }
+
     /// The length of the underlying file.
     ///
     /// Note that page allocation is lazily performed with mmap or after faulting in pages that
@@ -96,12 +130,27 @@ impl SecretArena {
         self.len_limit
     }
 
+    /// Query the number of mapped bytes from the file.
+    ///
+    /// This is an approximation as it may be out-of-date by the time the value is processed, if
+    /// other concurrent use of the allocator incurs additional mappings. It will never exceed
+    /// [`Self::memfd_len`].
+    ///
+    /// On systems that do not provide pointer-sized atomics (unlikely to exist, but technically
+    /// possible) this will always return `0`.
+    pub fn mapped_memory(&self) -> usize {
+        self.diagnostics.get_mapped_memory()
+    }
+
     /// Did a `truncate` syscall fail?
     ///
     /// That is not fatal but essentially leaves this allocator without any resources. That is,
     /// only zero-sized allocations can be served.
+    ///
+    /// On systems that do not provide pointer-sized atomics (unlikely to exist, but technically
+    /// possible) this will always return `false`.
     pub fn failed_truncate(&self) -> bool {
-        self.diagnostics.load_failure() & Diagnostics::MASK_TRUNCATE != 0
+        self.diagnostics.get_failure_value() & Diagnostics::MASK_TRUNCATE != 0
     }
 
     /// Did an `mmap` syscall fail?
@@ -109,8 +158,49 @@ impl SecretArena {
     /// That is not fatal but leaves this allocator with limited resources. The total amount of
     /// memory that can be served is fixed after this point. The failure may indicate that the
     /// number of pages would exceed the allowed limit of `RLIMIT_MEMLOCK` pages.
+    ///
+    /// On systems that do not provide pointer-sized atomics (unlikely to exist, but technically
+    /// possible) this will always return `false`.
     pub fn failed_mmap(&self) -> bool {
-        self.diagnostics.load_failure() & Diagnostics::MASK_MMAP != 0
+        self.diagnostics.get_failure_value() & Diagnostics::MASK_MMAP != 0
+    }
+
+    /// Query the amount of memory used.
+    pub fn mem_used(&self) -> usize {
+        let mut total = 0;
+
+        for map in &self.maps {
+            let Some(Some(map)) = map.get() else {
+                break;
+            };
+
+            if let Some(guard) = map.heap.try_lock() {
+                total += guard.used();
+            }
+        }
+
+        total
+    }
+
+    /// Query the amount of memory free.
+    ///
+    /// This only includes memory from the file descriptor that was already mapped. It is generally
+    /// smaller than [`Self::mapped_memory`] except there is no guaranteed synchronization between
+    /// the two.
+    pub fn mem_free(&self) -> usize {
+        let mut total = 0;
+
+        for map in &self.maps {
+            let Some(Some(map)) = map.get() else {
+                break;
+            };
+
+            if let Some(guard) = map.heap.try_lock() {
+                total += guard.free();
+            }
+        }
+
+        total
     }
 
     fn pre_ensure_size(&self, target: Layout) {
@@ -216,6 +306,8 @@ impl SecretArena {
 
         if called_here && mapping.is_none() {
             self.diagnostics.mmap_failed();
+        } else if called_here {
+            self.diagnostics.mapped_memory(len);
         }
 
         if mapping.is_none() {
@@ -269,6 +361,7 @@ impl SecretArena {
 }
 
 unsafe impl Send for SecretArena {}
+
 unsafe impl Sync for SecretArena {}
 
 impl Drop for SecretArena {
@@ -337,9 +430,29 @@ unsafe impl Allocator for SecretArena {
     }
 }
 
+#[derive(Default)]
+struct Diagnostics {
+    #[cfg(target_has_atomic = "ptr")]
+    failure: AtomicUsize,
+    #[cfg(target_has_atomic = "ptr")]
+    mapped_memory: AtomicUsize,
+}
+
 impl Diagnostics {
     const MASK_TRUNCATE: usize = 1 << 0;
     const MASK_MMAP: usize = 1 << 1;
+
+    fn reset(&mut self) {
+        #[cfg(target_has_atomic = "ptr")]
+        {
+            *self.failure.get_mut() = 0;
+            *self.mapped_memory.get_mut() = 0;
+        }
+    }
+
+    fn mapped_memory(&self, len: usize) {
+        self.mapped_memory.fetch_add(len, Ordering::Relaxed);
+    }
 
     fn truncate_failed(&self, _requested_len: usize) {
         #[cfg(target_has_atomic = "ptr")]
@@ -352,7 +465,19 @@ impl Diagnostics {
         self.failure.fetch_or(Self::MASK_MMAP, Ordering::Relaxed);
     }
 
-    fn load_failure(&self) -> usize {
+    fn get_mapped_memory(&self) -> usize {
+        #[cfg(target_has_atomic = "ptr")]
+        {
+            self.mapped_memory.load(Ordering::Relaxed)
+        }
+
+        #[cfg(not(target_has_atomic = "ptr"))]
+        {
+            0
+        }
+    }
+
+    fn get_failure_value(&self) -> usize {
         #[cfg(target_has_atomic = "ptr")]
         {
             self.failure.load(Ordering::Relaxed)
