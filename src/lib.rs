@@ -20,6 +20,25 @@ use spin::Once;
 /// global allocator, however in other situations you may prefer boxing it up itself. For the
 /// former you have to bring your own initialization routine (that copes with or ignores
 /// allocations requested before the file descriptor is fully opened).
+///
+/// # Usage
+///
+/// Use this for raw (pointer) allocations that you manipulate carefully and only pass to:
+///
+/// - functions written in assembly.
+/// - functions hardened against leakage by assembly checks.
+/// - OS interfaces that you have verified not to create shadow caches of it anywhere and do the
+///   same, best if they do not deal with the contents at all.
+///
+/// Please do __not__ use a `Vec` from this allocator and then pass it to `Read::read_to_end`. That
+/// subverts the main point as the contents may end up in registers or temporary buffers etc.
+/// Instead,  Well, I'm not the cyber-police so you may do it anyways and the result is certainly
+/// better than not caring at all—but still not *good*.
+///
+/// Please note that any live value will keep your OS from hibernating, like any locked pages
+/// would. If you care about battery lifetime then use this sparingly, temporarily, and clean this
+/// up. Unlike `mlock(2)`, this effect is scoped to the file descriptor according to the
+/// documentation, not merely existing mappings of the pages.
 pub struct SecretArena {
     /// The functions used to interact with the OS.
     fns: FnTable,
@@ -537,6 +556,7 @@ impl FnTable {
                     ptr::null_mut(),
                     len,
                     libc::PROT_READ | libc::PROT_WRITE,
+                    // Note that `PRIVATE` will not work.
                     libc::MAP_SHARED | libc::MAP_LOCKED,
                     fd,
                     offset,

@@ -16,3 +16,7 @@ allocator-api2 = { version = "*", default-features = false, features = ["alloc"]
 [[test]]
 name = "usage"
 required-features = ["allocator-api2"]
+
+[[test]]
+name = "unmap_relieves_pressure"
+required-features = ["allocator-api2"]
