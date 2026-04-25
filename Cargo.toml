@@ -2,8 +2,13 @@
 name = "allocator-memfd-secret"
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.95"
 
 [dependencies]
-allocator-api2 = { version = "0.3.1", default-features = false }
+allocator-api2 = { version = "0.4", default-features = false }
 libc = { version = "0.2.184", default-features = false }
-linked_list_allocator = { version = "0.10.5", default-features = false, features = [] }
+linked_list_allocator = { version = "0.10.5", default-features = false, features = ["use_spin"] }
+spin = { version = "0.10.0", default-features = false, features = ["once"] }
+
+[dev-dependencies]
+allocator-api2 = { version = "*", default-features = false, features = ["alloc"] }
